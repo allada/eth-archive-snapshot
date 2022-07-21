@@ -61,7 +61,7 @@ cd /zstd/zstd-1.5.2
 CC=clang-12 CXX=clang++-12 CFLAGS="-O3" make zstd
 ln -s /zstd/zstd-1.5.2/zstd /zstd/zstd
 
-# Download, setup and install bsc-geth.
+# Download, setup and install erigon.
 zfs create -o mountpoint=/erigon tank/erigon
 cd /erigon
 git clone https://github.com/ledgerwatch/erigon.git
@@ -69,7 +69,7 @@ git clone https://github.com/ledgerwatch/erigon.git
 # Setup zfs dataset and download the latest erigon snapshot into it.
 zfs create -o mountpoint=/erigon/data/erigon tank/erigon_data
 cd /erigon/data/erigon
-aws s3 cp --request-payer=requester "s3://public-blockchain-snapshots/bsc/erigon-latest.tar.zstd" - | pv | /zstd/zstd --long=31 -d | tar -xf -
+aws s3 cp --request-payer=requester "s3://public-blockchain-snapshots/ethereum/erigon-latest.tar.zstd" - | pv | /zstd/zstd --long=31 -d | tar -xf -
 
 # Set zfs's arc to 2GB. Erigon uses it's own cache system, so no need for zfs's.
 echo 2073741824 > /sys/module/zfs/parameters/zfs_arc_max
@@ -105,7 +105,7 @@ chown -R erigon:erigon /erigon/data/
 # This starts the erigon services.
 # You may follow the stdout/stderr of erigon services with:
 # sudo docker-compose logs -f
-ERIGON_FLAGS="--chain bsc --snapshots=false" \
+ERIGON_FLAGS="--snapshots=true" \
   DOCKER_UID=$(id -u erigon) \
   DOCKER_GID=$(id -g erigon) \
   XDG_DATA_HOME=/erigon/data \
@@ -114,7 +114,7 @@ ERIGON_FLAGS="--chain bsc --snapshots=false" \
   docker-compose up -d
 
 # Create script that can be used to upload a snapshot quickly.
-cat <<EOT > /home/ubuntu/create-bsc-snapshot.sh
+cat <<EOT > /home/ubuntu/create-eth-snapshot.sh
 set -ex
 # Just in case delete clone (if exists).
 zfs destroy tank/erigon_upload || true
@@ -129,7 +129,7 @@ docker-compose start
 # Clone drive and upload clone data and then delete clone
 zfs clone -o mountpoint=/erigon_upload tank/erigon_data@snap tank/erigon_upload
 cd /erigon_upload
-tar c ./ | /zstd/zstd -v -T0 -6 | aws s3 cp - s3://public-blockchain-snapshots/bsc/erigon-latest.tar.zstd --expected-size 4900000000000
+tar c ./ | /zstd/zstd -v -T0 -6 | aws s3 cp - s3://public-blockchain-snapshots/eth/erigon-latest.tar.zstd --expected-size 4900000000000
 cd /
 zfs destroy tank/erigon_upload
 zfs destroy tank/erigon_data@snap
@@ -137,7 +137,7 @@ EOT
 
 # If we are configured to auto upload a snapshot configure crontab.
 if [[ "${SHOULD_AUTO_UPLOAD_SNAPSHOT:-}" == "1" ]]; then
-  echo '@daily root /home/ubuntu/create-bsc-snapshot.sh' >> /etc/crontab
-  chmod +x /home/ubuntu/create-bsc-snapshot.sh
+  echo '@daily root /home/ubuntu/create-eth-snapshot.sh' >> /etc/crontab
+  chmod +x /home/ubuntu/create-eth-snapshot.sh
   service cron reload
 fi

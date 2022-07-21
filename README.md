@@ -1,17 +1,25 @@
-# BSC Archive Node Snapshot Tools
-This repository holds the tools and commands that can be used to deploy your own BSC Archive node by downloading pre-built snapshots and installing them on an instance.
+# Ethereum Archive Node Snapshot Tools
+This repository holds the tools and commands that can be used to deploy your own ETH Archive node by downloading pre-built snapshots and installing them on an instance.
+
+Note: Enough demand for an ethereum snapshot to be hosted that I have decided to start maintaining one.
+The original project was only to host the [Binance Smart Chain Archive Snapshot](https://github.com/allada/bsc-archive-snapshot). This project does come at a high personal cost. I do not represent a company and AWS
+costs to maintain this these projects has averaged about $700USD/mo that comes out of my pocket directly.
+
+Please consider donating especially if you are using this project to make money. I am considering changing
+the license from Apache (extremely permissive) to something that requires a license (ie: fee) if you derive
+money from it. I would like to avoid this at all costs though!
 
 You can support me in this kind of public work by donating to:
 `0xd6A6Da9F5622FcB3C9745a4DDA5DcCa75d92a1F0`
-Prefer binance smart chain, stable coins, eth, btc, or bsc.
+Prefer binance smart chain or ethereum, stable coins, eth, btc, or bnb.
 
 Thank you!
 
 
-# BSC Archive Snapshots
-All Binance Smart Chain Archive snapshots are hosted on S3 on the following path:
+# ETH Archive Snapshots
+All Ethereum Archive snapshots are hosted on S3 on the following path:
 
-| s3://public-blockchain-snapshots/bsc/
+| s3://public-blockchain-snapshots/ethereum/
 
 This path is public, but is configured as requester-pays. This means you'll need an AWS account in order access/download them. This is because I calculated that a full download will cost ~$100-150USD in just data transfer costs. You may greatly reduce this cost to nearly zero by using AWS in us-west-2 region. In such case, you should only need to pay for the cost of the api request (ie: <$0.10USD).
 
@@ -26,7 +34,6 @@ To build a server capable of running an archive node (this assumes ubuntu 20.04)
 
 # Why use Erigon?
 This snapshot uses [erigon](https://github.com/ledgerwatch/erigon) even though it is barely out of alpha stage. To understand why it is a bad idea to use `geth` as an archive node, you need to understand some internals on how `geth` works.
-
 
 ## Geth internals
 As a quick refresher, let's talk about what an archive node is; in simple terms, an archive node is a node that can run any contract on a smart chain at any given block. A full node on the other hand can generally only serve any contract at the most recent blocks. In addition, an archive node is also a full node by nature.
@@ -44,7 +51,7 @@ Erigon uses a completely different way of storing data. I have personally not du
 
 Erigon first stores the data of each wallet and contract in a flat key-value database ([mdbx](https://github.com/erthink/libmdbx) for default local db, but does support remote databases too). Geth also stores data in a flat key-value list, but geth uses LevelDB, which both have a different set of pros and cons. Once it downloads all the headers and such, it will eventually start to build the state of each block, however, it does not actually store the hashes, it just puts uses a block index number + contract/wallet address as the key. Erigon will eventually calculate the entire tree, but it will only do it for the last blocks. Erigon will also eventually build indexes for things like Log entries, Transactions, Sender/Recipient data and whatever other indexes are needed. Then when you want to execute a contract as an archive node, it will not use the merkle root, but instead just do a single lookup per key, instead of walking a trie.
 
-Not only is the data much smaller on disk and faster, but it is also highly compressible. As of Jan 26th 2022, the entire BSC archive is about 4.5TB compared to about 30TB required for `geth`. If you use a filesystem compressor too (like zfs + lz4), I see consistent 2.3x compression ratios with this configuration and about 4x ratios with `zstd` when uploading the tar.
+Not only is the data much smaller on disk and faster, but it is also highly compressible. If you use a filesystem compressor too (like zfs + lz4), I see consistent 2.3x compression ratios with this configuration and about 4x ratios with `zstd` when uploading the tar.
 
 ## Erigon's problems
 * Erigon is new and not yet battle tested
@@ -86,6 +93,3 @@ I suggest using something as follows in the event you need high availability:
 Spot instances are currently the absolute cheapest way to run an instance. The problem is that the instance might be terminated with a 2 minute warning, but with the proper infra you can just retry on another instance in the event of early-termination. Since it allows you to ensure a few are on-demand, the worst case is that users see a slow down when AWS resources are limited.
 
 Do not run all archive snapshots on the same instance, instead you should try and run smaller instances that can fit 1 to 2 archive snapshots on it at a time, but allow them to scale with the demand. This is because it is likely safe to assume that most users will likely be reading blocks closer to the head block than further back, if you can make that assumption, you can spin up more instances that have only that part of the chain. This has several advantages, the biggest advantage is that you can fit more of the chain into memory-per instance, this would likely not be the case if you ran all the chain on one node.
-
-# Do you still have the geth BSC archives?
-Yes, however they are only up to about mid December 2021 and in deep archive storage. If you need these archives, please reach out to me and I will see about resurrecting them and giving access, however this will come at a cost (as it will cost me to request them from AWS's deep archive storage).
