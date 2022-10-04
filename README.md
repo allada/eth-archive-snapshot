@@ -15,21 +15,28 @@ Prefer binance smart chain or ethereum, stable coins, eth, btc, or bnb.
 
 Thank you!
 
+# Other Snapshot Projects
+* [Binance Smart Chain Archive Snapshot](https://github.com/allada/bsc-archive-snapshot)
+* [Lighthouse Beacon Snapshot](https://github.com/allada/lighthouse-beacon-snapshot)
+
 # ETH Archive Snapshots
 All Ethereum Archive snapshots are hosted on S3 on the following path:
 
 | s3://public-blockchain-snapshots/eth/
 
-This path is public, but is configured as requester-pays. This means you'll need an AWS account in order access/download them. This is because I calculated that a full download will cost ~$100-150USD in just data transfer costs. You may greatly reduce this cost to nearly zero by using AWS in us-west-2 region. In such case, you should only need to pay for the cost of the api request (ie: <$0.10USD).
+This path is public, but is configured as requester-pays. This means you'll need an AWS account in order access/download them. This is because I calculated that a full download will cost \~$100-150USD in just data transfer costs. You may greatly reduce this cost to nearly zero by using AWS in us-west-2 region. In such case, you should only need to pay for the cost of the api request (ie: <$0.10USD).
 
 # Download and build a full archive node
 As reference code I have provided: `build_archive_node.sh` in this repo.
 
-To build a server capable of running an archive node (this assumes ubuntu 20.04):
+To build a server capable of running an archive node (this assumes ubuntu 22.04):
 * Get an AWS account and ensure it is configured on the computer (I strongly encourage you to run this in AWS's EC2 on `im4gn.2xlarge` or larger/similar in `us-west-2`)
 * Checkout this repo to the computer
 * Run `sudo ./build_archive_node.sh`.
 * When it is done, it should be serving an archive on port `8545`.
+
+# Lighthouse requirements
+As of the ETH 2.0 successful merge, erigon now needs a beacon node to be configured. This repository uses [Lighthouse](https://github.com/sigp/lighthouse) and a new project was created to hold a [Lighthouse beacon snapshot](https://github.com/allada/lighthouse-beacon-snapshot). The `build_archive_node.sh` script has already been updated to also run the beacon node with erigon by default.
 
 # Why use Erigon?
 This snapshot uses [erigon](https://github.com/ledgerwatch/erigon) even though it is barely out of alpha stage. To understand why it is a bad idea to use `geth` as an archive node, you need to understand some internals on how `geth` works.

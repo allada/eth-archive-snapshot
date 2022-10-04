@@ -36,11 +36,24 @@ function safe_wait() {
   done
 }
 
+# Utility function that will ensure one function with specific name will on system wide.
+# This will only have any effect if all other scripts use the same function.
+function mutex_function() {
+  local function_name="$1"
+  set -euxo pipefail
+
+  # Ensure only one instance of this function is running on entire system.
+  (
+    flock -x $fd
+    $function_name
+  ) {fd}>/tmp/$function_name.lock
+}
+
 function install_prereq() {
   set -euxo pipefail
   # Basic installs.
   apt update
-  DEBIAN_FRONTEND=noninteractive apt install -y zfsutils-linux unzip pv clang-12 make jq python3-boto3 super
+  DEBIAN_FRONTEND=noninteractive apt install -y zfsutils-linux unzip pv clang-12 make jq python3-boto3 super cmake
   # Use clang as our compiler by default if needed.
   ln -s $(which clang-12) /usr/bin/cc || true
   snap install --classic go
@@ -48,7 +61,7 @@ function install_prereq() {
   if ! cargo --version 2>&1 >/dev/null ; then
     # Install cargo.
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash /dev/stdin -y
-    source "$HOME/.cargo/env"
+    . "$HOME/.cargo/env"
   fi
 }
 
@@ -174,12 +187,20 @@ function install_erigon() {
   cd /erigon
   git clone https://github.com/ledgerwatch/erigon.git
   cd /erigon/erigon
-  git checkout f379f6728ca27a2254e7fab5711177e1050c06f0
+  git checkout v2022.09.03
   CC=clang-12 CXX=clang++-12 CFLAGS="-O3" make erigon
   ln -s /erigon/erigon/build/bin/erigon /usr/bin/erigon
 
   # Stop the service if it exists.
   systemctl stop erigon-eth || true
+}
+
+# Lighthouse is the default consensus layer, you can replace this with another if you'd desire.
+function setup_and_download_lighthouse_snapshot() {
+  set -euxo pipefail
+  # This will configure lighthouse to start and attach to erigon.
+  export LIGHTHOUSE_WITH_ERIGON=1
+  . <(curl https://raw.githubusercontent.com/allada/lighthouse-beacon-snapshot/master/build_lighthouse_beacon_node.sh)
 }
 
 function prepare_zfs_datasets() {
@@ -196,10 +217,8 @@ function download_snapshots() {
     zfs create -o mountpoint=/erigon/data/eth/snapshots tank/erigon_data/eth/snapshots
   fi
   mkdir -p /erigon/data/eth/snapshots/
-  # Download more aggressively by increasing the number of concurrent requests.
-  aws configure set s3.max_concurrent_requests 100 --profile erigon-more-concurrent-requests
   aws s3 sync \
-      --profile erigon-more-concurrent-requests \
+      --quiet \
       --request-payer requester \
       s3://public-blockchain-snapshots/eth/erigon-snapshots-folder-latest/ \
       /erigon/data/eth/snapshots/
@@ -215,6 +234,7 @@ function download_nodes() {
   # that refer to which protocol version it is using, so it's not easy to know if an upgrade
   # happens. The file is only about 1GB, so not a huge deal.
   aws s3 sync \
+      --quiet \
       --request-payer requester \
       s3://public-blockchain-snapshots/eth/erigon-nodes-folder-latest/ \
       /erigon/data/eth/nodes/ \
@@ -242,6 +262,14 @@ function download_database_file() {
 
 function prepare_erigon() {
   set -euxo pipefail
+  # Force creation of jwt.hex key. This is because we need this to exist for lighthouse too.
+  if [ ! -f /erigon/data/eth/jwt.hex ]; then
+    printf '0x' > /erigon/data/eth/jwt.hex
+    openssl rand -hex 32 >> /erigon/data/eth/jwt.hex
+    # This file must be readable by lighthouse user.
+    chmod 744 /erigon/data/eth/jwt.hex
+  fi
+
   # Create erigon user if needed.
   useradd erigon || true
 
@@ -266,21 +294,48 @@ WantedBy=multi-user.target
 ' > /etc/systemd/system/erigon-eth.service
 
   echo '#!/bin/bash' > /erigon/start_erigon_service.sh
+  echo 'set -x' >> /erigon/start_erigon_service.sh
   if [[ "${SHOULD_AUTO_UPLOAD_SNAPSHOT:-}" == "1" ]]; then
-    # Run erigon in a subshell but append the subshell's process id to first stdout.
-    # Also give special environ that tells erigon to stop processing new blocks after Finish stage.
-    echo -n "sh -c '>&2 echo \$\$; STOP_AFTER_STAGE=Finish " >> /erigon/start_erigon_service.sh
+    # Wait for erigon to get a block with a timestamp greater than a specific timestamp then kill erigon.
+    cat <<'EOT' >> /erigon/start_erigon_service.sh
+function stop_after_block_timestamp() {
+  set -xe
+  local stop_after_timestamp="$1"
+  local process_id="$2"
+  while sleep 10; do
+    local hex=$(curl -s -H "Content-Type: application/json" -X POST --data '{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["latest", false],"id":1}' 127.0.0.1:8545 \
+                  | jq -r '.result.timestamp' \
+                  | cut -c3-)
+    local current_timestamp=$(echo "ibase=16; ${hex^^}" | bc)
+    if [ "$current_timestamp" -gt "$stop_after_timestamp" ]; then
+      kill $process_id || true
+      return
+    fi
+  done
+}
+
+sh -c '
+EOT
   fi
 
-  echo -n "exec erigon --snapshots=true --datadir=/erigon/data/eth --txpool.disable" >> /erigon/start_erigon_service.sh
+  echo "exec erigon --snapshots=true --datadir=/erigon/data/eth --txpool.disable" >> /erigon/start_erigon_service.sh
 
   if [[ "${SHOULD_AUTO_UPLOAD_SNAPSHOT:-}" == "1" ]]; then
-    # Create a subshell that will get the process id of the erigon and forward stdout as it comes in
-    # but if it has the magic string 'STOP_AFTER_STAGE env flag forced to stop app' it will shutdown
-    # erigon and start a snapshot.
-    # Sadly erigon does not properly shutdown everything when the flag is set, it only stops
-    # processing new blocks.
-    echo "' 2> >(PARENT_PID=\$(head -1); while read -r line; do echo >&2 \"\$line\"; if [[ \"\$line\" == *'STOP_AFTER_STAGE env flag forced to stop app'* ]]; then kill \$PARENT_PID || true; fi done)" >> /erigon/start_erigon_service.sh
+    # Run in background because we want to make the non `SHOULD_AUTO_UPLOAD_SNAPSHOT` path pretty but keep
+    # the ability to capture the proper process ids and such.
+    echo "' &" >> /erigon/start_erigon_service.sh
+    echo 'process_id=$!' >> /erigon/start_erigon_service.sh
+
+    # Wait for erigon to process a block with a timstamp greater than now then kill erigon.
+    echo 'stop_after_block_timestamp "$(date +"%s")" "$process_id"' >> /erigon/start_erigon_service.sh
+
+    echo 'wait $process_id || true' >> /erigon/start_erigon_service.sh
+    # In case the parent bash script gets interrupted, we want to double ensure our erigon process gets
+    # terminated too.
+    echo 'kill $process_id || true' >> /erigon/start_erigon_service.sh
+    # Trick used to wait for process to fully terminate.
+    echo 'tail --pid=$process_id -f /dev/null' >> /erigon/start_erigon_service.sh
+    # Run our `create-eth-snapshot-and-shutdown.sh` script as root (without needing sudoer).
     echo 'super create-eth-snapshot-and-shutdown' >> /erigon/start_erigon_service.sh
   fi
 
@@ -384,6 +439,12 @@ aws s3 sync /erigon/data/eth/nodes s3://public-blockchain-snapshots/eth/erigon-n
 zfs set readonly=on tank/erigon_data/eth/chaindata
 upload_mdbx_file &
 
+# Stop our lighthouse-beacon so we can safely upload it.
+systemctl stop lighthouse-beacon
+
+# Note: ZFS readonly will happen in this script.
+/lighthouse/create-lighthouse-snapshot.sh &
+
 # If one of the background tasks has a bad exit code it's ok.
 wait # Wait for all background tasks to finish.
 EOT
@@ -393,25 +454,29 @@ EOT
   echo "create-eth-snapshot-and-shutdown     /erigon/create-eth-snapshot-and-shutdown.sh uid=root erigon" >> /etc/super.tab
 }
 
-install_prereq
-setup_drives
+mutex_function install_prereq
+mutex_function setup_drives
+
+# Because we run our commands in a subshell we want to give cargo access to all future commands.
+. "$HOME/.cargo/env"
 
 # These installations can happen in parallel.
-install_zstd &
+mutex_function install_zstd &
 
-install_aws_cli &
-install_s3pcp &
-install_putils &
-install_erigon &
+mutex_function install_aws_cli &
+mutex_function install_s3pcp &
+mutex_function install_putils &
+mutex_function install_erigon &
 safe_wait # Wait for our parallel jobs finish.
 
-prepare_zfs_datasets
+mutex_function prepare_zfs_datasets
 
-download_snapshots & # Download just the snapshots folder.
-download_nodes & # Downloads the last known list of nodes.
-download_database_file & # Download the database file. This is the bulk of the downloads.
+mutex_function setup_and_download_lighthouse_snapshot &
+mutex_function download_snapshots & # Download just the snapshots folder.
+mutex_function download_nodes & # Downloads the last known list of nodes.
+mutex_function download_database_file & # Download the database file. This is the bulk of the downloads.
 safe_wait # Wait for download_snapshot to finish.
 
-prepare_erigon
-run_erigon
-add_create_snapshot_script
+mutex_function prepare_erigon
+mutex_function run_erigon
+mutex_function add_create_snapshot_script
