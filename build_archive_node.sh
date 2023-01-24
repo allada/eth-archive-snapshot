@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright 2021 Nathan (Blaise) Bruer
+# Copyright 2021-2023 Nathan (Blaise) Bruer
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -24,10 +24,44 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
+
+# Curious on why this script is so complicated when it is just downloading stuff and
+# configuring erigon?
+#
+# The short answer is because it costs a lot of money to maintain archive snapshots and
+# I needed to use a lot of tricks to save money. Some of the tricks I used are:
+# * When downloading the snapshots, use as much system resources as possible to get the
+#   data on disk as fast as possible. This is why there is so much parallelism happening.
+# * Similar to above, when uploading is happening, use mega-parallelism.
+# * Compress the data as much as possible, as the data is quite large.
+# * When uploading the snapshots directory (~25% of the archive size), only upload the
+#   parts that changed. This saves ~25% of upload time.
+# * There is/was not a lot of references on how to run an archive node. This script gives
+#   a reference guide on how to do it, which is why there's so much setup.
+# * At one point I frequently had users complain that the download would abruptly stop
+#   when downloading outside of us-west-2. This is because I simply replace existing
+#   files in s3 and have the s3 bucket configured to delete old versions of the file
+#   after a few days. This caused users download to be interrupted if a new version
+#   was uploaded while they are downloading. To solve this, I wrote a custom downloader
+#   that first queries the most recent version, then downloads that version specifically.
+
+
 # If set to "1", will create a crontab entry to upload a snapshot daily.
 # This requires write permission to `s3://public-blockchain-snapshots`.
 # You may also set this through an environmental variable at startup.
 # SHOULD_AUTO_UPLOAD_SNAPSHOT="0"
+
+# Below is just a comment. It is done this way to make copy and paste much easier.
+# These are the commands used to create an image of a snapshot node.
+# When it's done the instance will reboot.
+# Make sure you launch the instance with the EC2 tag attached to the instance of:
+# `no-launch` set to something and the `Allow tags in metadata` flag checked.
+cat <<EOF > /dev/null
+sudo sh -c 'curl https://raw.githubusercontent.com/allada/eth-archive-snapshot/master/build_archive_node.sh > /home/ubuntu/build_archive_node.sh'
+sudo sh -c "echo \"@reboot root sh -c 'curl --fail http://169.254.169.254/latest/meta-data/tags/instance/no-launch || SHOULD_AUTO_UPLOAD_SNAPSHOT=1 /home/ubuntu/build_archive_node.sh || shutdown +5 now'\" >> /etc/crontab"
+sudo chmod +x /home/ubuntu/build_archive_node.sh
+sudo CREATE_SNAPSHOT_MODE=1 /home/ubuntu/build_archive_node.sh
+EOF
 
 function safe_wait() {
   BACKGROUND_PIDS=( $(jobs -p) )
@@ -36,32 +70,60 @@ function safe_wait() {
   done
 }
 
-# Utility function that will ensure one function with specific name will on system wide.
-# This will only have any effect if all other scripts use the same function.
-function mutex_function() {
-  local function_name="$1"
-  set -euxo pipefail
+# This is pretty much the same as: `aws s3 sync s3://foo/bar /foo/bar`, but with better
+# parallelization.
+function parallel_sync_download() {
+  set -euo pipefail
+  full_s3_path=$1
+  shift
+  local_path=$1
+  shift
 
-  # Ensure only one instance of this function is running on entire system.
-  (
-    flock -x $fd
-    $function_name
-  ) {fd}>/tmp/$function_name.lock
+  s3_bucket=$(echo "$full_s3_path" | cut -d'/' -f3)
+  s3_path="${full_s3_path#s3://$s3_bucket/}"
+
+  num_cores=$(nproc)
+  # This is an inverse log10(). The lower the number of cores you have the more processes you'll
+  # spawn. The logic here is that on less powerful machines you'll almost certainly want more
+  # than 1 download going on at a time. The same in reverse, on 128 core machines, you will be
+  # limited by network instead of cpu ability. 128 cores = 73 jobs, 64 cores = 42 jobs,
+  # 32 cores = 25 jobs, 16 cores = 16 jobs, 4 cores = 8 jobs, exc...
+  parallel_count=$(echo "x = $num_cores / (l($num_cores) / l(16)); scale=0; x / 1" | bc -l)
+
+  set +x # Reduces the noise of commands being generated.
+
+  # Download all the individual files from aws, decompress them, then place them into the snapshots
+  # folder. This is similar to running:
+  #   aws s3 sync --request-payer=requester s3://public-blockchain-snapshots/eth/erigon/archive/latest/v1/snapshots/ /erigon/data/eth/snapshots/
+  # The major difference is that it will, while downloading, decompress each file.
+  commands=()
+  for aws_path in $(aws s3 ls --request-payer=requester --recursive "$full_s3_path" | tr -s ' ' ' ' | cut -d' ' -f4); do
+    relative_path=$(dirname "${aws_path#$s3_path}")
+    file=$(basename $aws_path)
+
+    read_remote_file="aws s3 cp --request-payer=requester s3://$s3_bucket/$aws_path -"
+    mkdir -p "$local_path/$relative_path"
+    decompress="pzstd -d -q --stdout"
+    save_to_file="cat > $local_path/$relative_path/${file%.zstd}"
+    commands+=("sh -c '$read_remote_file | $decompress | $save_to_file'")
+  done
+  ( IFS=$'\n'; echo "${commands[*]}" ) | \
+    pjoin --parallel-count $parallel_count
 }
 
 function install_prereq() {
   set -euxo pipefail
   # Basic installs.
   apt update
-  DEBIAN_FRONTEND=noninteractive apt install -y zfsutils-linux unzip pv clang-12 make jq python3-boto3 super cmake
+  DEBIAN_FRONTEND=noninteractive apt install -y zfsutils-linux unzip pv clang-12 make jq python3-boto3 super
   # Use clang as our compiler by default if needed.
   ln -s $(which clang-12) /usr/bin/cc || true
   snap install --classic go
 
   if ! cargo --version 2>&1 >/dev/null ; then
     # Install cargo.
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash /dev/stdin -y
-    . "$HOME/.cargo/env"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash /dev/stdin -y --default-toolchain=1.64.0
+    source "$HOME/.cargo/env"
   fi
 }
 
@@ -187,20 +249,12 @@ function install_erigon() {
   cd /erigon
   git clone https://github.com/ledgerwatch/erigon.git
   cd /erigon/erigon
-  git checkout v2022.09.03
+  git checkout v2.36.0
   CC=clang-12 CXX=clang++-12 CFLAGS="-O3" make erigon
   ln -s /erigon/erigon/build/bin/erigon /usr/bin/erigon
 
   # Stop the service if it exists.
   systemctl stop erigon-eth || true
-}
-
-# Lighthouse is the default consensus layer, you can replace this with another if you'd desire.
-function setup_and_download_lighthouse_snapshot() {
-  set -euxo pipefail
-  # This will configure lighthouse to start and attach to erigon.
-  export LIGHTHOUSE_WITH_ERIGON=1
-  . <(curl https://raw.githubusercontent.com/allada/lighthouse-beacon-snapshot/master/build_lighthouse_beacon_node.sh)
 }
 
 function prepare_zfs_datasets() {
@@ -217,11 +271,12 @@ function download_snapshots() {
     zfs create -o mountpoint=/erigon/data/eth/snapshots tank/erigon_data/eth/snapshots
   fi
   mkdir -p /erigon/data/eth/snapshots/
-  aws s3 sync \
-      --quiet \
-      --request-payer requester \
-      s3://public-blockchain-snapshots/eth/erigon-snapshots-folder-latest/ \
-      /erigon/data/eth/snapshots/
+
+  parallel_sync_download s3://public-blockchain-snapshots/eth/erigon/archive/latest/v1/snapshots/ /erigon/data/eth/snapshots/
+
+  # We then need to touch each .idx file. This is because erigon needs each .idx file to have an
+  # mtime greater than the .seq file.
+  find /erigon/data/eth/snapshots/ -type f -name "*.idx" -exec touch {} \;
 }
 
 # This is not strictly required, but it will make it much faster for a node to join the pool.
@@ -230,15 +285,9 @@ function download_nodes() {
   if ! zfs list tank/erigon_data/eth/nodes ; then
     zfs create -o mountpoint=/erigon/data/eth/nodes tank/erigon_data/eth/nodes
   fi
-  # TODO(allada) Figure out a way to compress and decompress this. It has directories inside it
-  # that refer to which protocol version it is using, so it's not easy to know if an upgrade
-  # happens. The file is only about 1GB, so not a huge deal.
-  aws s3 sync \
-      --quiet \
-      --request-payer requester \
-      s3://public-blockchain-snapshots/eth/erigon-nodes-folder-latest/ \
-      /erigon/data/eth/nodes/ \
-  || true # This command is allowed to fail since it's only an optimization.
+
+  # This command is allowed to fail.
+  parallel_sync_download s3://public-blockchain-snapshots/eth/erigon/archive/latest/v1/nodes/ /erigon/data/eth/nodes/nodes/ || true
 }
 
 # This complicated bit of code accomplishes 2 goals.
@@ -250,25 +299,20 @@ function download_nodes() {
 #    about 3-4x faster than using normal `aws s3 cp` + `zstd -d`.
 function download_database_file() {
   set -euxo pipefail
-  if zfs list tank/erigon_data/eth/chaindata ; then
-    return # Already have chaindata.
+  if ! zfs list tank/erigon_data/eth/chaindata ; then
+    zfs create -o mountpoint=/erigon/data/eth/chaindata tank/erigon_data/eth/chaindata
   fi
-  zfs create -o mountpoint=/erigon/data/eth/chaindata tank/erigon_data/eth/chaindata
 
-  s3pcp --requester-pays s3://public-blockchain-snapshots/eth/erigon-16k-db-latest.mdbx.zstd \
+  # Remove the file if it exists.
+  rm -rf /erigon/data/eth/chaindata/mdbx.dat || true
+
+  s3pcp --requester-pays s3://public-blockchain-snapshots/eth/erigon/archive/latest/v1/chaindata/mdbx.dat.zstd \
     | pv \
     | pzstd -p $(nproc) -q -d -f -o /erigon/data/eth/chaindata/mdbx.dat
 }
 
 function prepare_erigon() {
   set -euxo pipefail
-  # Force creation of jwt.hex key. This is because we need this to exist for lighthouse too.
-  if [ ! -f /erigon/data/eth/jwt.hex ]; then
-    printf '0x' > /erigon/data/eth/jwt.hex
-    openssl rand -hex 32 >> /erigon/data/eth/jwt.hex
-    # This file must be readable by lighthouse user.
-    chmod 744 /erigon/data/eth/jwt.hex
-  fi
 
   # Create erigon user if needed.
   useradd erigon || true
@@ -366,7 +410,7 @@ trap 'shutdown now' EXIT
 function upload_mdbx_file() {
   upload_id=$(aws s3api create-multipart-upload \
       --bucket public-blockchain-snapshots \
-      --key eth/erigon-16k-db-latest.mdbx.zstd \
+      --key eth/erigon/archive/latest/v1/chaindata/mdbx.dat.zstd \
       --request-payer requester \
     | jq -r ".UploadId")
 
@@ -407,7 +451,7 @@ function upload_mdbx_file() {
             --body /erigon_upload_tmp/working_stdout/\$(printf %05d \$SEQ) \
             --request-payer requester \
             --bucket public-blockchain-snapshots \
-            --key eth/erigon-16k-db-latest.mdbx.zstd \
+            --key eth/erigon/archive/latest/v1/chaindata/mdbx.dat.zstd \
             --upload-id $upload_id \
             --part-number \$SEQ \
         | jq -r .ETag | tr -d \\\" | tee > /erigon_upload_tmp/upload_part_results/\$(printf %05d \$SEQ)') && \
@@ -421,7 +465,7 @@ part_nums=os.listdir('/erigon_upload_tmp/upload_part_results/')
 part_nums.sort()
 boto3.client('s3').complete_multipart_upload(
     Bucket='public-blockchain-snapshots',
-    Key='eth/erigon-16k-db-latest.mdbx.zstd',
+    Key='eth/erigon/archive/latest/v1/chaindata/mdbx.dat.zstd',
     UploadId='$upload_id',
     RequestPayer='requester',
     MultipartUpload={
@@ -430,20 +474,61 @@ boto3.client('s3').complete_multipart_upload(
 )"
 }
 
+# Note: This will also delete remote files that are not local.
+# This is pretty much the same as `aws s3 sync /local/folder/ s3://foo/bar/`, but better
+# parallization.
+function parallel_sync_upload() {
+  set +x
+  local_path=$1
+  shift
+  full_s3_path=$1
+  shift
+
+  s3_bucket=$(echo "$full_s3_path" | cut -d'/' -f3)
+  s3_path="${full_s3_path#s3://$s3_bucket/}"
+  s3_path="${s3_path%/}"
+
+  local_files=$(find $local_path -type f | cut -c$((${#local_path}+1))- | sed -e 's/$/.zstd/' | sort)
+  remote_files=$(aws s3 ls --recursive "$full_s3_path" | tr -s ' ' ' ' | cut -d' ' -f4 | cut -c$((${#s3_path}+2))- | sort)
+  files_to_remove=$(comm -13 <(echo "$local_files") <(echo "$remote_files"))
+  files_to_upload=$(comm -23 <(echo "$local_files") <(echo "$remote_files"))
+  set -x
+  for s3_delete_file in $files_to_remove ; do
+    aws s3 rm "s3://$s3_bucket/$s3_path/$s3_delete_file"
+  done
+
+  num_cores=$(nproc)
+  # This is an inverse log10(). The lower the number of cores you have the more processes you'll
+  # spawn. The logic here is that on less powerful machines you'll almost certainly want more
+  # than 1 download going on at a time. The same in reverse, on 128 core machines, you will be
+  # limited by network instead of cpu ability. 128 cores = 85 jobs, 64 cores = 50 jobs,
+  # 32 cores = 31 jobs, 16 cores = 20 jobs, 4 cores = 10 jobs, exc...
+  parallel_count=$(echo "x = $num_cores / (l(($num_cores + 2) / 2) / l(16)); scale=0; x / 1" | bc -l)
+
+  # Download all the individual files from aws, decompress them, then place them into the snapshots
+  # folder. This is similar to running:
+  #   aws s3 sync --request-payer=requester $full_s3_path $local_path
+  # The major difference is that it will, while downloading, decompress each file.
+  commands=()
+  for relative_path_with_zstd in $files_to_upload ; do
+    relative_path="${relative_path_with_zstd%.zstd}"
+    compress_file="pzstd -6 -q --stdout $local_path/$relative_path"
+    upload_file="aws s3 cp - ${full_s3_path%}${relative_path}.zstd"
+    commands+=("sh -c '$compress_file | $upload_file'")
+  done
+  if [ "${#commands[@]}" -gt 0 ] ; then
+    ( IFS=$'\n'; echo "${commands[*]}" ) | pjoin --parallel-count $parallel_count
+  fi
+}
+
 zfs set readonly=on tank/erigon_data/eth/snapshots
-aws s3 sync /erigon/data/eth/snapshots s3://public-blockchain-snapshots/eth/erigon-snapshots-folder-latest/ &
+parallel_sync_upload /erigon/data/eth/snapshots/ s3://public-blockchain-snapshots/eth/erigon/archive/latest/v1/snapshots/ &
 
 zfs set readonly=on tank/erigon_data/eth/nodes
-aws s3 sync /erigon/data/eth/nodes s3://public-blockchain-snapshots/eth/erigon-nodes-folder-latest/ &
+parallel_sync_upload /erigon/data/eth/nodes/ s3://public-blockchain-snapshots/eth/erigon/archive/latest/v1/nodes/ &
 
 zfs set readonly=on tank/erigon_data/eth/chaindata
 upload_mdbx_file &
-
-# Stop our lighthouse-beacon so we can safely upload it.
-systemctl stop lighthouse-beacon
-
-# Note: ZFS readonly will happen in this script.
-/lighthouse/create-lighthouse-snapshot.sh &
 
 # If one of the background tasks has a bad exit code it's ok.
 wait # Wait for all background tasks to finish.
@@ -454,29 +539,55 @@ EOT
   echo "create-eth-snapshot-and-shutdown     /erigon/create-eth-snapshot-and-shutdown.sh uid=root erigon" >> /etc/super.tab
 }
 
-mutex_function install_prereq
-mutex_function setup_drives
+install_prereq
+install_aws_cli
+
+# Check to see if the user has AWS credentials configured.
+if ! aws s3 ls --request-payer=requester s3://public-blockchain-snapshots ; then
+  echo "It appears you do not have AWS credentials configured on this computer or user."
+  echo "Normally this can be fixed by running 'aws configure' (maybe with sudo)."
+  echo "Please see the following link for more details:"
+  echo "https://docs.aws.amazon.com/cli/latest/userguide/getting-started-quickstart.html"
+  exit 1
+fi
 
 # Because we run our commands in a subshell we want to give cargo access to all future commands.
-. "$HOME/.cargo/env"
+source "$HOME/.cargo/env"
+
+setup_drives
+
+# Overlay the tmp folder because our builds use it. Later we will revert it back.
+zfs create -o mountpoint=/tmp tank/tmp
 
 # These installations can happen in parallel.
-mutex_function install_zstd &
-
-mutex_function install_aws_cli &
-mutex_function install_s3pcp &
-mutex_function install_putils &
-mutex_function install_erigon &
+install_zstd &
+install_s3pcp &
+install_putils &
+install_erigon &
 safe_wait # Wait for our parallel jobs finish.
 
-mutex_function prepare_zfs_datasets
+# Revert back our tmp directory.
+zfs destroy tank/tmp
 
-mutex_function setup_and_download_lighthouse_snapshot &
-mutex_function download_snapshots & # Download just the snapshots folder.
-mutex_function download_nodes & # Downloads the last known list of nodes.
-mutex_function download_database_file & # Download the database file. This is the bulk of the downloads.
+# This should only be set if we are only configuring the instance for an EBS snapshot.
+# Only set this global if you want to create your own snapshots and create an image of
+# this instance as a template for faster startup.
+if [[ "${CREATE_SNAPSHOT_MODE:-}" == "1" ]]; then
+  apt update
+  # This fixes an error when upgrading default ubuntu 22.04 instance.
+  DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-arm64
+  DEBIAN_FRONTEND=noninteractive apt upgrade -y
+  shutdown -r +1
+  exit
+fi
+
+prepare_zfs_datasets
+
+download_snapshots & # Download just the snapshots folder.
+download_nodes & # Downloads the last known list of nodes.
+download_database_file & # Download the database file. This is the bulk of the downloads.
 safe_wait # Wait for download_snapshot to finish.
 
-mutex_function prepare_erigon
-mutex_function run_erigon
-mutex_function add_create_snapshot_script
+prepare_erigon
+run_erigon
+add_create_snapshot_script
