@@ -133,7 +133,7 @@ function setup_drives() {
     return # Our drives are probably already setup.
   fi
   # Creates a new pool with the default device.
-  DEVICES=( $(lsblk --fs --json | jq -r '.blockdevices[] | select(.children == null and .fstype == null) | .name') )
+  DEVICES=( $(lsblk --fs --json | jq -r '.blockdevices[] | select(.children == null and .fstype == null and (.name | test("loop") | not)) | .name') )
   DEVICES_FULLNAME=()
   for DEVICE in "${DEVICES[@]}"; do
     DEVICES_FULLNAME+=("/dev/$DEVICE")
