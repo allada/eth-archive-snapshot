@@ -249,7 +249,7 @@ function install_erigon() {
   cd /erigon
   git clone https://github.com/ledgerwatch/erigon.git
   cd /erigon/erigon
-  git checkout v2.36.0
+  git checkout v2.45.3
   CC=clang-12 CXX=clang++-12 CFLAGS="-O3" make erigon
   ln -s /erigon/erigon/build/bin/erigon /usr/bin/erigon
 
@@ -362,7 +362,7 @@ sh -c '
 EOT
   fi
 
-  echo "exec erigon --snapshots=true --datadir=/erigon/data/eth --txpool.disable" >> /erigon/start_erigon_service.sh
+  echo "exec erigon --snapshots=true --datadir=/erigon/data/eth --txpool.disable --internalcl" >> /erigon/start_erigon_service.sh
 
   if [[ "${SHOULD_AUTO_UPLOAD_SNAPSHOT:-}" == "1" ]]; then
     # Run in background because we want to make the non `SHOULD_AUTO_UPLOAD_SNAPSHOT` path pretty but keep
